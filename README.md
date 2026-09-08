@@ -165,12 +165,17 @@ Environment variables:
 
 | Key | Value | Required |
 | --- | --- | --- |
-| `PYTHON_VERSION` | `3.13.7` | Recommended |
+| `PYTHON_VERSION` | `3.13` | Recommended |
 | `ALLOWED_ORIGINS` | `*` (default) or `https://your-app.vercel.app` | Optional |
 
 `PORT` is injected by Render — do not set it yourself. Pin `PYTHON_VERSION`
 because Render's current default is 3.14, and the versions pinned in
 `requirements.txt` were only verified on 3.13.
+
+Use the minor version (`3.13`), not an exact patch. Both Render and Vercel now
+provision Python through `uv`, which resolves `3.13` to whatever 3.13.x it has
+available. Asking for a specific patch it hasn't cached fails the build with
+`No interpreter found for Python 3.13.x`.
 
 ### Frontend → Vercel
 
