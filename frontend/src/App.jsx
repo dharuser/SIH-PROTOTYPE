@@ -16,7 +16,7 @@ import {
 } from './api'
 
 export default function App() {
-  const { connection, stats, alerts, flows } = useTelemetry()
+  const { connection, stats, alerts, flows, sendCommand } = useTelemetry()
   const [toast, setToast] = useState(null)
   const [busy, setBusy] = useState(false)
 
@@ -37,20 +37,33 @@ export default function App() {
     if (connection !== 'live' || autoStarted.current) return
     autoStarted.current = true
     if (!stats.running) {
-      startSimulation().catch(() => {
-        /* the Start button is still available */
-      })
+      // Sent over the socket so the instance we are streaming from is the one
+      // that starts generating traffic. Falls back to REST if the socket
+      // isn't ready yet.
+      if (!sendCommand({ action: 'start' })) {
+        startSimulation().catch(() => {
+          /* the Start button is still available */
+        })
+      }
     }
-  }, [connection, stats.running])
+  }, [connection, stats.running, sendCommand])
 
   const handleTriggerAttack = useCallback(
     async (threatType) => {
       setBusy(true)
+      const label = threatMeta(threatType).label
       try {
-        const result = await triggerAttack(threatType)
-        showToast(
-          `${threatMeta(threatType).label} injected - ${result.flows_injected} flow records now being analysed`,
-        )
+        // Prefer the open socket: a REST call can be answered by a different
+        // server instance than the one feeding this page, in which case the
+        // alert would never appear here.
+        if (sendCommand({ action: 'trigger_attack', threat_type: threatType })) {
+          showToast(`${label} injected - watch the alerts table`)
+        } else {
+          const result = await triggerAttack(threatType)
+          showToast(
+            `${label} injected - ${result.flows_injected} flow records now being analysed`,
+          )
+        }
       } catch (error) {
         showToast(`Could not trigger attack: ${error.message}`, 'error')
       } finally {
@@ -58,19 +71,21 @@ export default function App() {
         setTimeout(() => setBusy(false), 600)
       }
     },
-    [showToast],
+    [showToast, sendCommand],
   )
 
   const handleSimAction = useCallback(
-    async (action, label) => {
+    async (action, label, wsAction) => {
       try {
-        await action()
+        if (!(wsAction && sendCommand({ action: wsAction }))) {
+          await action()
+        }
         showToast(label)
       } catch (error) {
         showToast(error.message, 'error')
       }
     },
-    [showToast],
+    [showToast, sendCommand],
   )
 
   return (
@@ -100,10 +115,18 @@ export default function App() {
         running={stats.running}
         busy={busy}
         onTriggerAttack={handleTriggerAttack}
-        onStart={() => handleSimAction(startSimulation, 'Background traffic started')}
-        onStop={() => handleSimAction(stopSimulation, 'Background traffic paused')}
+        onStart={() =>
+          handleSimAction(startSimulation, 'Background traffic started', 'start')
+        }
+        onStop={() =>
+          handleSimAction(stopSimulation, 'Background traffic paused', 'stop')
+        }
         onReset={() =>
-          handleSimAction(resetSimulation, 'Counters and alert history cleared')
+          handleSimAction(
+            resetSimulation,
+            'Counters and alert history cleared',
+            'reset',
+          )
         }
       />
 

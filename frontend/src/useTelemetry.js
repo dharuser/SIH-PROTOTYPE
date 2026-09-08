@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef } from 'react'
+import { useCallback, useEffect, useReducer, useRef } from 'react'
 import { websocketUrl } from './api'
 
 const MAX_ALERTS = 25 // a little more than the 20 the table shows
@@ -84,6 +84,25 @@ export function useTelemetry() {
   const [state, dispatch] = useReducer(reducer, initialState)
   const socketRef = useRef(null)
 
+  /**
+   * Sends a control command back up the open socket.
+   *
+   * Returns false if the socket isn't ready, so callers can fall back to REST.
+   * Preferring the socket matters when the API runs on more than one instance:
+   * a REST call may be answered by an instance this browser isn't streaming
+   * from, and the resulting alert would never reach this screen.
+   */
+  const sendCommand = useCallback((command) => {
+    const socket = socketRef.current
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false
+    try {
+      socket.send(JSON.stringify(command))
+      return true
+    } catch {
+      return false
+    }
+  }, [])
+
   useEffect(() => {
     let closed = false
     let reconnectTimer = null
@@ -141,5 +160,5 @@ export function useTelemetry() {
     }
   }, [])
 
-  return state
+  return { ...state, sendCommand }
 }

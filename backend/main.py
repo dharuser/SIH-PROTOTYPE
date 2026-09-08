@@ -11,6 +11,7 @@ TLS in front of it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -145,6 +146,46 @@ async def trigger_attack(threat_type: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def _handle_command(raw: str) -> None:
+    """
+    Execute a control command that arrived over the WebSocket.
+
+    The REST endpoints below do exactly the same things, but a REST call is a
+    fresh HTTP request that any server instance may answer. When the API is
+    hosted on a platform that runs several instances, that means the request can
+    easily land on an instance the caller's browser is NOT streaming from, and
+    the resulting alert is broadcast to a different set of sockets - the button
+    looks dead. Routing controls back down the socket the client is already
+    attached to keeps the command and the stream on the same instance.
+
+    Unrecognised or malformed messages are ignored on purpose; the client also
+    sends plain "ping" keepalives through here.
+    """
+    raw = raw.strip()
+    if not raw or raw == "ping":
+        return
+
+    try:
+        message = json.loads(raw)
+    except (ValueError, TypeError):
+        return
+    if not isinstance(message, dict):
+        return
+
+    action = message.get("action")
+
+    if action == "trigger_attack":
+        threat_type = message.get("threat_type")
+        if threat_type in config.THREAT_TYPES:
+            await simulation.trigger_attack(threat_type)
+    elif action == "start":
+        await simulation.start()
+    elif action == "stop":
+        await simulation.stop()
+    elif action == "reset":
+        await simulation.reset()
+
+
 @app.websocket("/ws")
 async def stream(websocket: WebSocket) -> None:
     """
@@ -152,6 +193,12 @@ async def stream(websocket: WebSocket) -> None:
 
     On connect the client receives one `snapshot` message, then a continuous
     series of `flow`, `alert`, `status`, `reset` and `scenario_started` messages.
+
+    The client may also send control commands up this socket as JSON:
+        {"action": "start"}
+        {"action": "stop"}
+        {"action": "reset"}
+        {"action": "trigger_attack", "threat_type": "flood"}
     """
     await simulation.hub.connect(websocket)
     try:
@@ -159,9 +206,8 @@ async def stream(websocket: WebSocket) -> None:
         # owning this socket delivers the snapshot ahead of any live traffic.
         simulation.hub.send_to(websocket, {"type": "snapshot", "data": simulation.snapshot()})
         while True:
-            # The dashboard is a pure consumer; this receive only keeps the
-            # socket open and lets us notice a disconnect promptly.
-            await websocket.receive_text()
+            raw = await websocket.receive_text()
+            await _handle_command(raw)
     except WebSocketDisconnect:
         pass
     except Exception:
