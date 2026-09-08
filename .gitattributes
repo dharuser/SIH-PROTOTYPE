@@ -1,0 +1,15 @@
+# Normalise line endings to LF in the repository and on checkout.
+#
+# The backend is developed on Windows but built on Linux (Render). Files like
+# backend/.python-version are parsed literally, and a stray CR would make the
+# version string unreadable. Forcing LF keeps the Linux build byte-identical to
+# what was tested.
+* text=auto eol=lf
+
+# Binary assets should never be touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
