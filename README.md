@@ -95,8 +95,28 @@ Trigger an attack without the UI:
 curl.exe -X POST http://127.0.0.1:8000/api/attack/flood
 ```
 
-WebSocket messages are `{ "type": ..., "data": ..., "stats": ... }` where `type` is one
-of `snapshot`, `flow`, `alert`, `status`, `reset`, `scenario_started`.
+WebSocket messages from the server are `{ "type": ..., "data": ..., "stats": ... }`
+where `type` is one of `snapshot`, `flow`, `alert`, `status`, `reset`,
+`scenario_started`.
+
+The client may also send controls **up** the same socket:
+
+```json
+{"action": "start"}
+{"action": "stop"}
+{"action": "reset"}
+{"action": "trigger_attack", "threat_type": "flood"}
+```
+
+The dashboard prefers this over the equivalent REST calls, and it is not a
+stylistic choice. The API can run on more than one instance. A REST control call
+is a fresh HTTP request that any instance may answer, so an attack triggered from
+the browser was often executed on an instance that browser was not streaming
+from — the alert was broadcast to a different set of sockets and the button
+looked dead. Measured on the live deployment: **1 of 5** concurrent viewers saw
+the alert they triggered. Sending the command up the socket the client is already
+attached to guarantees the trigger and the stream share an instance, which took
+it to **5 of 5**. REST remains as a fallback for when the socket isn't open.
 
 ---
 
@@ -163,12 +183,17 @@ Root Directory set, Vercel scans from the top, finds `backend/requirements.txt`,
 decides the project is Python, and builds the wrong half. That is the single
 most likely thing to go wrong when redeploying from scratch.
 
-Vercel runs the FastAPI backend on a persistent instance, so the always-on
-background simulation and the streaming WebSocket both work — verified live.
-The one caveat is that all state is in memory: if Vercel ever runs two instances,
-a browser's WebSocket may attach to one while an attack POST lands on the other,
-and the alert would not appear on screen. A page refresh reattaches the socket.
-Traffic at demo scale keeps this to a single instance.
+Vercel runs the FastAPI backend on persistent instances, so the always-on
+background simulation and the streaming WebSocket both work — verified live over
+a 3-minute connection.
+
+**Vercel does run several instances under concurrent load**, and each holds its
+own in-memory state and its own traffic generator. That is why dashboard controls
+travel up the WebSocket rather than over REST (see the API section above).
+Consequence worth knowing: each viewer effectively gets an independent
+simulation, with their own counters and their own attack bursts. Two people
+watching see different numbers. For a demo that is fine, arguably better — nobody
+can reset anyone else's screen.
 
 ### Alternative: backend → Render
 
