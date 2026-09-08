@@ -145,13 +145,36 @@ how far past it the count already is, so repeated demos show varying, defensible
 
 ---
 
-## Deployment (Render + Vercel)
+## Deployment
 
-The two halves are deployed separately and only need to know each other's URL.
+Both halves are deployed as **two separate Vercel projects from this one repo**,
+distinguished only by their Root Directory. They are live at:
 
-### Backend → Render
+| Part | URL | Root Directory |
+| --- | --- | --- |
+| Dashboard | https://sih-prototype-dashboard.vercel.app | `frontend` |
+| API | https://sih-prototype-lvry.vercel.app | `backend` |
 
-Create a new **Web Service** from the repo, then set:
+The frontend project sets `VITE_API_URL` and `VITE_WS_URL` to the API project's
+origin. Nothing else connects them.
+
+**Root Directory is the setting that matters.** With two apps in one repo and no
+Root Directory set, Vercel scans from the top, finds `backend/requirements.txt`,
+decides the project is Python, and builds the wrong half. That is the single
+most likely thing to go wrong when redeploying from scratch.
+
+Vercel runs the FastAPI backend on a persistent instance, so the always-on
+background simulation and the streaming WebSocket both work — verified live.
+The one caveat is that all state is in memory: if Vercel ever runs two instances,
+a browser's WebSocket may attach to one while an attack POST lands on the other,
+and the alert would not appear on screen. A page refresh reattaches the socket.
+Traffic at demo scale keeps this to a single instance.
+
+### Alternative: backend → Render
+
+Render runs a single always-on instance, which removes the multi-instance caveat
+above at the cost of a ~50s cold start on the free tier. Create a **Web Service**
+from the repo, then set:
 
 | Setting | Value |
 | --- | --- |
@@ -177,9 +200,12 @@ provision Python through `uv`, which resolves `3.13` to whatever 3.13.x it has
 available. Asking for a specific patch it hasn't cached fails the build with
 `No interpreter found for Python 3.13.x`.
 
+If you switch to Render, update `VITE_API_URL` / `VITE_WS_URL` in the Vercel
+frontend project to the Render origin and redeploy.
+
 ### Frontend → Vercel
 
-Import the same repo as a new project, then set:
+Import the repo as a new project, then set:
 
 | Setting | Value |
 | --- | --- |
