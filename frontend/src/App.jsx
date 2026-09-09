@@ -4,6 +4,7 @@ import AlertTable from './components/AlertTable'
 import ControlPanel from './components/ControlPanel'
 import FlowTicker from './components/FlowTicker'
 import HowItWorks from './components/HowItWorks'
+import SourcePanel from './components/SourcePanel'
 import StatCards from './components/StatCards'
 import ThreatChart from './components/ThreatChart'
 import { threatMeta } from './threats'
@@ -133,6 +134,7 @@ export default function App() {
       <div className="dashboard-grid">
         <AlertTable alerts={alerts} />
         <div className="side-column">
+          <SourcePanel stats={stats} />
           <ThreatChart countsByType={stats.alerts_by_type} />
           <FlowTicker flows={flows} />
         </div>

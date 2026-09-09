@@ -214,3 +214,16 @@ def stamp_now(flow: FlowRecord) -> FlowRecord:
     flow.timestamp = utc_now_iso()
     flow.epoch = time.monotonic()
     return flow
+
+
+def stamp_epoch(flow: FlowRecord) -> FlowRecord:
+    """
+    Set only the sliding-window clock, preserving the record's own timestamp.
+
+    Used for flows captured by a real sensor: the sensor already recorded when
+    the traffic happened, and overwriting that would be falsifying the data. The
+    detectors still need a local monotonic reading to age their windows, which is
+    what this supplies.
+    """
+    flow.epoch = time.monotonic()
+    return flow

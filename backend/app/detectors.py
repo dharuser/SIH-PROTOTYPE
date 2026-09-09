@@ -113,6 +113,7 @@ class FloodDetector(BaseDetector):
             dest_ip=flow.dest_ip,
             confidence=round(confidence, 2),
             evidence=evidence,
+            source=flow.source,
         )
 
 
@@ -173,6 +174,7 @@ class PortScanDetector(BaseDetector):
             dest_ip=flow.dest_ip,
             confidence=round(confidence, 2),
             evidence=evidence,
+            source=flow.source,
         )
 
 
@@ -222,6 +224,7 @@ class ExfiltrationDetector(BaseDetector):
             dest_ip=flow.dest_ip,
             confidence=round(confidence, 2),
             evidence=evidence,
+            source=flow.source,
         )
 
 

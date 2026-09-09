@@ -16,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from collections import deque
+from datetime import datetime
 from typing import Any, Deque
 
-from . import config, generator
+from . import config, generator, models
 from .detectors import DetectionEngine
 from .hub import ConnectionHub
 from .models import Alert, FlowRecord, SimulationStats, utc_now_iso
@@ -37,6 +39,14 @@ class SimulationService:
         self._alerts_raised = 0
         self._alerts_by_type: dict[str, int] = {name: 0 for name in config.THREAT_TYPES}
         self._started_at: str | None = None
+
+        # Live sensor bookkeeping
+        self._live_flows = 0
+        self._simulated_flows = 0
+        self._sensor_host: str | None = None
+        self._sensor_interface: str | None = None
+        self._sensor_last_seen: float | None = None
+        self._sensor_last_seen_iso: str | None = None
 
         self._alert_history: Deque[Alert] = deque(maxlen=config.ALERT_HISTORY_SIZE)
         self._flow_history: Deque[FlowRecord] = deque(maxlen=config.FLOW_HISTORY_SIZE)
@@ -67,13 +77,25 @@ class SimulationService:
 
     # -- state -------------------------------------------------------------
 
+    SENSOR_TIMEOUT_SECONDS = 15.0
+
     def stats(self) -> SimulationStats:
+        sensor_live = (
+            self._sensor_last_seen is not None
+            and (time.monotonic() - self._sensor_last_seen) < self.SENSOR_TIMEOUT_SECONDS
+        )
         return SimulationStats(
             running=self._running,
             flows_processed=self._flows_processed,
             alerts_raised=self._alerts_raised,
             alerts_by_type=dict(self._alerts_by_type),
             started_at=self._started_at,
+            live_flows=self._live_flows,
+            simulated_flows=self._simulated_flows,
+            sensor_connected=sensor_live,
+            sensor_host=self._sensor_host,
+            sensor_interface=self._sensor_interface,
+            sensor_last_seen=self._sensor_last_seen_iso,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -117,6 +139,8 @@ class SimulationService:
             self._alerts_by_type = {name: 0 for name in config.THREAT_TYPES}
             self._alert_history.clear()
             self._flow_history.clear()
+            self._live_flows = 0
+            self._simulated_flows = 0
             self.detection.reset()
             self._started_at = utc_now_iso() if self._running else None
         logger.info("simulation reset")
@@ -155,6 +179,69 @@ class SimulationService:
             "label": config.THREAT_LABELS[threat_type],
             "flows_injected": len(records),
             "estimated_seconds": round(len(records) * gap, 1),
+        }
+
+    # -- live sensor ingest ------------------------------------------------
+
+    async def ingest_flows(
+        self,
+        records: list[FlowRecord],
+        host: str | None = None,
+        interface: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Accept real flow records captured from a network interface.
+
+        These go through exactly the same detectors, thresholds and cooldowns as
+        simulated traffic. That is the whole point: the rules cannot tell the
+        difference, so a detection on live traffic proves the rules work on live
+        traffic, not just on data we invented.
+
+        Runs regardless of whether the simulator is started, so a sensor can feed
+        a dashboard with the synthetic generator switched off entirely.
+        """
+        self._sensor_host = host or self._sensor_host
+        self._sensor_interface = interface or self._sensor_interface
+        self._sensor_last_seen = time.monotonic()
+        self._sensor_last_seen_iso = utc_now_iso()
+
+        alerts_before = self._alerts_raised
+
+        # Rebuild each record's sliding-window clock from the timestamp the
+        # sensor actually observed, anchored so the newest record is "now".
+        # Without this every flow in a batch would share one instant, and the
+        # evidence strings would claim things like "12 ports in 0.0s". Keeping
+        # the real spacing also means a scan spread over an hour correctly fails
+        # to trip a 5-second rule.
+        now = time.monotonic()
+        pairs: list[tuple[FlowRecord, float]] = []
+        for record in records:
+            try:
+                pairs.append(
+                    (record, datetime.fromisoformat(record.timestamp).timestamp())
+                )
+            except (ValueError, TypeError):
+                pairs.append((record, 0.0))
+
+        # A batch is a dictionary drain, so it arrives in arbitrary order. The
+        # detectors' sliding windows prune from the front and assume time only
+        # moves forward, so feed them chronologically.
+        pairs.sort(key=lambda item: item[1])
+        newest = max((t for _, t in pairs if t > 0), default=0.0)
+
+        async with self._emit_lock:
+            for record, seen_at in pairs:
+                record.source = models.SOURCE_LIVE
+                if seen_at > 0 and newest > 0:
+                    record.epoch = now - (newest - seen_at)
+                else:
+                    record.epoch = now
+                await self._process(record, restamp=False, reuse_epoch=True)
+
+        return {
+            "accepted": len(records),
+            "alerts_raised": self._alerts_raised - alerts_before,
+            "live_flows_total": self._live_flows,
         }
 
     async def _replay(self, records: list[FlowRecord], gap: float) -> None:
@@ -204,10 +291,24 @@ class SimulationService:
 
     # -- the read-only pipeline -------------------------------------------
 
-    async def _process(self, record: FlowRecord) -> None:
-        flow = generator.stamp_now(record)
+    async def _process(
+        self, record: FlowRecord, restamp: bool = True, reuse_epoch: bool = False
+    ) -> None:
+        # Simulated records are stamped at the moment they are released.
+        # Captured records keep the timestamp the sensor observed; their window
+        # clock is set by the caller from that timestamp.
+        if restamp:
+            flow = generator.stamp_now(record)
+        elif reuse_epoch:
+            flow = record
+        else:
+            flow = generator.stamp_epoch(record)
 
         self._flows_processed += 1
+        if flow.source == models.SOURCE_LIVE:
+            self._live_flows += 1
+        else:
+            self._simulated_flows += 1
         self._flow_history.append(flow)
 
         alerts = self.detection.analyze(flow)

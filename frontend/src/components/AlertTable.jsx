@@ -43,6 +43,7 @@ export default function AlertTable({ alerts }) {
               <th scope="col">Time</th>
               <th scope="col">Threat</th>
               <th scope="col">Source</th>
+              <th scope="col">Origin</th>
               <th scope="col">Confidence</th>
               <th scope="col">Why it fired</th>
             </tr>
@@ -50,7 +51,7 @@ export default function AlertTable({ alerts }) {
           <tbody aria-live="polite" aria-relevant="additions">
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={5} className="empty-row">
+                <td colSpan={6} className="empty-row">
                   No threats detected yet. Press one of the buttons above to
                   simulate an attack.
                 </td>
@@ -63,6 +64,15 @@ export default function AlertTable({ alerts }) {
                     <ThreatBadge threatType={alert.threat_type} />
                   </td>
                   <td className="mono">{alert.source_ip}</td>
+                  <td>
+                    <span
+                      className={`origin-tag ${
+                        alert.source === 'live' ? 'origin-live' : 'origin-sim'
+                      }`}
+                    >
+                      {alert.source === 'live' ? 'LIVE' : 'SIM'}
+                    </span>
+                  </td>
                   <td>
                     <ConfidenceMeter value={alert.confidence} />
                   </td>

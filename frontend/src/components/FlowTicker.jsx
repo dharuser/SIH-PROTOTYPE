@@ -34,6 +34,11 @@ export default function FlowTicker({ flows }) {
                 {flow.dest_ip}:{flow.dest_port}
               </span>
               <span className="ticker-bytes">
+                {flow.source === 'live' && (
+                  <span className="ticker-live" title="Captured from a real interface">
+                    LIVE
+                  </span>
+                )}
                 in {formatBytes(flow.bytes_in)} / out{' '}
                 {formatBytes(flow.bytes_out)}
               </span>

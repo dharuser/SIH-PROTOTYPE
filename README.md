@@ -87,6 +87,7 @@ feed is running.
 | `POST` | `/api/simulation/stop` | Pause background traffic |
 | `POST` | `/api/simulation/reset` | Clear counters, history and detector windows |
 | `POST` | `/api/attack/{threat_type}` | Trigger `flood`, `port_scan` or `exfiltration` |
+| `POST` | `/api/ingest` | Receive real captured flows from the sensor |
 | `WS` | `/ws` | Live stream of flow records and alerts |
 
 Trigger an attack without the UI:
@@ -131,8 +132,11 @@ backend/
     models.py          FlowRecord, Alert, SimulationStats
     generator.py       Synthetic traffic + the three attack scenarios
     detectors.py       The three rules and the evidence strings
-    engine.py          Wires generator -> detectors -> WebSocket
+    engine.py          Wires generator -> detectors -> WebSocket, plus ingest
     hub.py             WebSocket fan-out (one queue + writer per client)
+sensor/
+  agent.py             Real packet capture -> flow records -> /api/ingest
+                       (stdlib only; live interface or .pcap replay)
 frontend/
   vite.config.js       Dev server + /api and /ws proxy to port 8000
   src/
@@ -149,6 +153,12 @@ frontend/
 
 ## Design notes
 
+**The data source is interchangeable.** Detectors receive seven fields and nothing
+else — no handle to the generator, no notion of where a record came from. That is
+why the same rules run unchanged over real captured packets. It is also the honest
+answer to "is this only synthetic?": run `sensor/agent.py` and watch real traffic
+go through the identical pipeline.
+
 **Benign traffic cannot produce a false positive.** This is structural, not luck. The
 generator's client pool holds 18 hosts (below the 25-source flood threshold), benign
 traffic uses 6 ports (below the 12-port scan threshold), and benign byte ratios are
@@ -162,6 +172,85 @@ stopped firing.
 
 **Confidence is derived, not hardcoded.** It scores how fast a threshold was crossed and
 how far past it the count already is, so repeated demos show varying, defensible numbers.
+
+---
+
+## Live capture: analysing real network traffic
+
+The simulator exists so a demo is reproducible. It is not the only data source.
+`sensor/agent.py` reads **real packets** off a network interface, summarises them
+into the same seven-field flow records, and posts them to the analyser.
+
+**The detection code is not involved in this distinction.** Detectors only ever
+see the seven fields, and `source` is metadata no rule reads. A live record is
+judged by identical thresholds and identical cooldowns. That is the point: a
+detection on captured traffic proves the rules work on captured traffic.
+
+The sensor also mirrors the architecture being modelled — it reads packets and
+sends summaries in one direction, and the analyser has no channel back to it.
+
+### Run it
+
+Live capture is a privileged operation on every OS, so use an elevated shell.
+
+```powershell
+# Terminal 1 - analyser
+cd backend
+uvicorn main:app --port 8000
+
+# Terminal 2 - dashboard
+cd frontend
+npm run dev
+
+# Terminal 3 - AS ADMINISTRATOR
+cd sensor
+py agent.py --backend http://127.0.0.1:8000
+```
+
+The dashboard's **Data source** panel switches to `LIVE CAPTURE`, and every
+captured alert is tagged `LIVE` in the alerts table.
+
+Useful flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--list` | show local IPv4 addresses and whether you are elevated |
+| `--pcap FILE` | replay a real `.pcap` instead of capturing — **no privileges needed** |
+| `--dry-run` | print flows without sending them |
+| `--interface IP` | Windows: which local IP to bind. Linux: interface name |
+| `--duration N` | stop after N seconds |
+
+### If you cannot get Administrator
+
+Capture in Wireshark, save as **pcap** (not pcapng), and replay it:
+
+```powershell
+py agent.py --pcap capture.pcap --backend http://127.0.0.1:8000
+```
+
+The packets are still genuine, just recorded earlier. Replay preserves each
+packet's original timestamp, so a scan recorded over 4 seconds is analysed as
+having taken 4 seconds.
+
+### What live traffic actually triggers
+
+**Exfiltration is the reliable live demo.** Upload a large file to any cloud
+service and the rule fires, because a bulk upload genuinely is far more data
+leaving than entering. Verified on a real capture: *309.4 KB sent out vs only
+2.0 KB received — 158x more data leaving than entering.*
+
+Port scans fire if something scans the machine, or if you scan a host yourself.
+Floods need many distinct source IPs, which is hard to produce honestly on one
+laptop — that is what the simulator button is for. Being straightforward about
+this is stronger than pretending otherwise.
+
+### Important: live mode needs a single-instance backend
+
+Run the analyser **locally** for live capture, or on a single-instance host such
+as Render. On Vercel the API is replicated, so the sensor's batch may be received
+by a different instance than the dashboard is streaming from, and the captured
+flows would not appear on screen. Same root cause as the WebSocket control
+decision documented above.
 
 ---
 

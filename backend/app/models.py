@@ -12,10 +12,21 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+SOURCE_SIMULATED = "simulated"
+SOURCE_LIVE = "live"
+
+
 class FlowRecord(BaseModel):
     """
-    One unidirectional network flow record, as it would arrive from a tap on a
-    one-way link. These are the only fields the detectors are allowed to see.
+    One unidirectional network flow record.
+
+    The seven fields below are the only thing the detectors are ever allowed to
+    see. That is what makes the data source interchangeable: a record captured
+    from a real network interface and a record invented by the simulator are
+    indistinguishable to the detection rules.
+
+    `source` is metadata for the dashboard only. No detector reads it, so a live
+    record is never judged by a different standard than a simulated one.
     """
 
     timestamp: str
@@ -26,8 +37,11 @@ class FlowRecord(BaseModel):
     bytes_out: int
     protocol: str
 
+    # "simulated" or "live" - provenance label, shown in the UI.
+    source: str = SOURCE_SIMULATED
+
     # Internal only: monotonic-ish epoch seconds used for sliding windows.
-    # Excluded from every JSON payload so the wire format matches the spec.
+    # Excluded from every JSON payload so the wire format stays clean.
     epoch: float = Field(default=0.0, exclude=True)
 
 
@@ -40,6 +54,9 @@ class Alert(BaseModel):
     dest_ip: str
     confidence: float
     evidence: str
+
+    # Carried through from the flow that triggered it.
+    source: str = SOURCE_SIMULATED
 
 
 class SimulationStats(BaseModel):
@@ -56,3 +73,11 @@ class SimulationStats(BaseModel):
         }
     )
     started_at: str | None = None
+
+    # Live sensor telemetry, so the dashboard can prove real traffic is arriving.
+    live_flows: int = 0
+    simulated_flows: int = 0
+    sensor_connected: bool = False
+    sensor_host: str | None = None
+    sensor_interface: str | None = None
+    sensor_last_seen: str | None = None

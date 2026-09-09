@@ -18,10 +18,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from app import config
 from app.engine import SimulationService
-from app.models import Alert, SimulationStats
+from app.models import Alert, FlowRecord, SimulationStats
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 logger = logging.getLogger("passive-threat-detector")
@@ -139,6 +140,39 @@ async def trigger_attack(threat_type: str) -> dict:
             detail=f"Unknown scenario '{threat_type}'. Expected one of: "
             + ", ".join(config.THREAT_TYPES),
         )
+
+
+# ---------------------------------------------------------------------------
+# Live sensor ingest
+# ---------------------------------------------------------------------------
+
+
+class SensorBatch(BaseModel):
+    """A batch of real flow records captured by the sensor agent."""
+
+    host: str | None = None
+    interface: str | None = None
+    flows: list[FlowRecord]
+
+
+@app.post("/api/ingest", tags=["live sensor"])
+async def ingest(batch: SensorBatch) -> dict:
+    """
+    Receive real network flows from the capture sensor.
+
+    The sensor runs next to the monitored network, reads packets off an interface
+    and posts summarised flows here. Traffic only ever moves sensor -> analyser,
+    which is the same direction of travel a physical data diode permits.
+
+    These records are analysed by the identical three rules used for simulated
+    traffic. Nothing about the detection is relaxed or special-cased.
+    """
+    if len(batch.flows) > 5000:
+        raise HTTPException(status_code=413, detail="Batch too large; send under 5000 flows.")
+
+    return await simulation.ingest_flows(
+        batch.flows, host=batch.host, interface=batch.interface
+    )
 
 
 # ---------------------------------------------------------------------------
