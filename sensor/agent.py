@@ -20,9 +20,11 @@ Capture modes
   packet      raw packet capture from a live interface   (needs Administrator/root)
               full fidelity: endpoints, ports, timing AND byte volumes
   connection  OS connection table polling                (NO privileges needed)
-              real endpoints, ports, timing and owning process, but no byte
-              volumes - the operating system does not expose per-connection
-              counters, so the exfiltration rule cannot run in this mode
+              real endpoints, ports and owning process, but no byte volumes
+              (the OS does not expose per-connection counters to an
+              unprivileged process) and it SAMPLES, so connections that open
+              and close between polls are missed. Good for proving the data is
+              real; not a complete view.
   pcap        replay a real .pcap file                   (NO privileges needed)
               full fidelity, from traffic recorded earlier
 
@@ -765,9 +767,11 @@ def main() -> None:
     print(f"  source    : {getattr(capture, 'bind_ip', '?')}")
     print(f"  byte volumes measurable : {measures_bytes}")
     if not measures_bytes:
-        print("    -> flood, port scan and beaconing rules active")
-        print("    -> exfiltration rule inactive (needs per-connection volumes,")
-        print("       which the OS will not give an unprivileged process)")
+        print("    NOTE: this mode samples the OS connection table, so it")
+        print("    (a) cannot measure byte volumes -> exfiltration rule inactive")
+        print("    (b) may miss connections that open and close between polls")
+        print("    Real endpoints, ports and process names are accurate.")
+        print("    Use --mode packet (as Administrator) for complete capture.")
     print("-" * 70)
     print("  Ctrl+C to stop.")
     if measures_bytes and mode != "pcap":

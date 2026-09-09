@@ -222,10 +222,23 @@ sends summaries in one direction, and the analyser has no channel back to it.
 
 `connection` mode reads the operating system's own connection table. It gives
 genuine endpoints, ports, protocol and the owning program with no privileges at
-all — but neither Windows nor Linux exposes per-connection byte counters to an
-unprivileged process. Those fields are reported as zero rather than estimated,
-which means the exfiltration rule stays silent in this mode instead of firing on
-numbers nobody measured. Flood, port scan and beaconing all work.
+all. It has two honest limitations, both measured rather than assumed:
+
+**No byte volumes.** Neither Windows nor Linux exposes per-connection counters to
+an unprivileged process. Those fields are reported as zero rather than estimated,
+so the exfiltration rule stays silent in this mode instead of firing on numbers
+nobody measured.
+
+**It samples, so it can miss short connections.** The connection table is polled
+on an interval; a request that opens and closes between two polls is never seen.
+Measured directly: 12 deliberately-timed HTTPS requests produced only 5 captured
+flows, and the beaconing rule correctly did not fire because it never received
+enough events. Connection mode is therefore excellent for proving the data is
+real and attributing it to a program, but it is a sampled view, not a complete
+one.
+
+**Use `packet` mode for actual detection work.** It sees every packet, measures
+real volumes, and misses nothing. That is the mode to run for a serious demo.
 
 Measured on a normal Windows laptop with no elevation: 82 real flows captured,
 process names on 44 of 50 (`brave.exe`, `node.exe`, `AvastSvc.exe`, `svchost.exe`),
