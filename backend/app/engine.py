@@ -25,6 +25,7 @@ from . import config, generator, models
 from .detectors import DetectionEngine
 from .hub import ConnectionHub
 from .models import Alert, FlowRecord, SimulationStats, utc_now_iso
+from .storage import AlertStore
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,13 @@ class SimulationService:
         self._flows_processed = 0
         self._alerts_raised = 0
         self._alerts_by_type: dict[str, int] = {name: 0 for name in config.THREAT_TYPES}
+        self._alerts_by_severity: dict[str, int] = {
+            config.SEVERITY_CRITICAL: 0,
+            config.SEVERITY_HIGH: 0,
+            config.SEVERITY_MEDIUM: 0,
+        }
         self._started_at: str | None = None
+        self.store = AlertStore(config.DB_PATH, enabled=config.DB_ENABLED)
 
         # Live sensor bookkeeping
         self._live_flows = 0
@@ -47,6 +54,7 @@ class SimulationService:
         self._sensor_interface: str | None = None
         self._sensor_last_seen: float | None = None
         self._sensor_last_seen_iso: str | None = None
+        self._sensor_throughput: dict[str, Any] | None = None
 
         self._alert_history: Deque[Alert] = deque(maxlen=config.ALERT_HISTORY_SIZE)
         self._flow_history: Deque[FlowRecord] = deque(maxlen=config.FLOW_HISTORY_SIZE)
@@ -89,6 +97,7 @@ class SimulationService:
             flows_processed=self._flows_processed,
             alerts_raised=self._alerts_raised,
             alerts_by_type=dict(self._alerts_by_type),
+            alerts_by_severity=dict(self._alerts_by_severity),
             started_at=self._started_at,
             live_flows=self._live_flows,
             simulated_flows=self._simulated_flows,
@@ -96,6 +105,7 @@ class SimulationService:
             sensor_host=self._sensor_host,
             sensor_interface=self._sensor_interface,
             sensor_last_seen=self._sensor_last_seen_iso,
+            sensor_throughput=self._sensor_throughput if sensor_live else None,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -110,7 +120,12 @@ class SimulationService:
                 "port_scan_unique_ports": config.PORT_SCAN_UNIQUE_PORT_THRESHOLD,
                 "port_scan_window_seconds": config.PORT_SCAN_WINDOW_SECONDS,
                 "exfiltration_ratio": config.EXFIL_RATIO_THRESHOLD,
+                "beacon_min_events": config.BEACON_MIN_EVENTS,
+                "beacon_max_variation": config.BEACON_MAX_CV,
             },
+            "mitre": config.MITRE_MAPPING,
+            "severity": config.THREAT_SEVERITY,
+            "storage_available": self.store.available,
         }
 
     def recent_alerts(self, limit: int = 20) -> list[Alert]:
@@ -137,6 +152,11 @@ class SimulationService:
             self._flows_processed = 0
             self._alerts_raised = 0
             self._alerts_by_type = {name: 0 for name in config.THREAT_TYPES}
+            self._alerts_by_severity = {
+                config.SEVERITY_CRITICAL: 0,
+                config.SEVERITY_HIGH: 0,
+                config.SEVERITY_MEDIUM: 0,
+            }
             self._alert_history.clear()
             self._flow_history.clear()
             self._live_flows = 0
@@ -172,7 +192,11 @@ class SimulationService:
             }
         )
 
-        asyncio.create_task(self._replay(records, gap))
+        asyncio.create_task(
+            self._replay(
+                records, gap, exclusive=threat_type not in generator.SLOW_SCENARIOS
+            )
+        )
 
         return {
             "threat_type": threat_type,
@@ -188,6 +212,7 @@ class SimulationService:
         records: list[FlowRecord],
         host: str | None = None,
         interface: str | None = None,
+        throughput: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Accept real flow records captured from a network interface.
@@ -204,6 +229,8 @@ class SimulationService:
         self._sensor_interface = interface or self._sensor_interface
         self._sensor_last_seen = time.monotonic()
         self._sensor_last_seen_iso = utc_now_iso()
+        if throughput:
+            self._sensor_throughput = throughput
 
         alerts_before = self._alerts_raised
 
@@ -244,12 +271,28 @@ class SimulationService:
             "live_flows_total": self._live_flows,
         }
 
-    async def _replay(self, records: list[FlowRecord], gap: float) -> None:
-        """Feed a pre-built burst into the pipeline, paced so the UI can follow."""
-        async with self._emit_lock:
-            for record in records:
+    async def _replay(
+        self, records: list[FlowRecord], gap: float, exclusive: bool = True
+    ) -> None:
+        """
+        Feed a pre-built burst into the pipeline, paced so the UI can follow.
+
+        Fast bursts hold the emit lock for their whole run so two overlapping
+        attacks cannot interleave. Slow scenarios (beaconing) take the lock one
+        record at a time instead, otherwise background traffic would visibly
+        freeze for several seconds while they play out.
+        """
+        if exclusive:
+            async with self._emit_lock:
+                for record in records:
+                    await self._process(record)
+                    await asyncio.sleep(gap)
+            return
+
+        for record in records:
+            async with self._emit_lock:
                 await self._process(record)
-                await asyncio.sleep(gap)
+            await asyncio.sleep(gap)
 
     # -- background loops --------------------------------------------------
 
@@ -320,7 +363,11 @@ class SimulationService:
             self._alerts_by_type[alert.threat_type] = (
                 self._alerts_by_type.get(alert.threat_type, 0) + 1
             )
+            self._alerts_by_severity[alert.severity] = (
+                self._alerts_by_severity.get(alert.severity, 0) + 1
+            )
             self._alert_history.append(alert)
+            self.store.record(alert)
 
         stats = self.stats().model_dump()
 

@@ -231,14 +231,93 @@ class ExfiltrationDetector(BaseDetector):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Rule 4 - C2 beaconing
+# "This host calls the same address on a metronome. People do not do that."
+# ---------------------------------------------------------------------------
+
+
+class BeaconingDetector(BaseDetector):
+    threat_type = config.THREAT_BEACONING
+
+    def __init__(self) -> None:
+        self._by_pair: dict[tuple[str, str], Deque[float]] = defaultdict(deque)
+        self._cooldown_until: dict[tuple[str, str], float] = {}
+
+    def reset(self) -> None:
+        self._by_pair.clear()
+        self._cooldown_until.clear()
+
+    def inspect(self, flow: FlowRecord) -> Alert | None:
+        key = (flow.source_ip, flow.dest_ip)
+        window = self._by_pair[key]
+
+        # Collapse rapid packets inside one conversation: we are interested in
+        # how often a NEW check-in starts, not in every record of a transfer.
+        if window and (flow.epoch - window[-1]) < config.BEACON_MIN_INTERVAL:
+            return None
+
+        window.append(flow.epoch)
+
+        cutoff = flow.epoch - config.BEACON_WINDOW_SECONDS
+        while window and window[0] < cutoff:
+            window.popleft()
+
+        if len(window) < config.BEACON_MIN_EVENTS:
+            return None
+
+        gaps = [b - a for a, b in zip(window, list(window)[1:])]
+        if len(gaps) < 2:
+            return None
+
+        mean_gap = sum(gaps) / len(gaps)
+        if not (config.BEACON_MIN_INTERVAL <= mean_gap <= config.BEACON_MAX_INTERVAL):
+            return None
+
+        variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
+        std_dev = variance ** 0.5
+        coefficient_of_variation = std_dev / mean_gap if mean_gap else 1.0
+
+        if coefficient_of_variation > config.BEACON_MAX_CV:
+            return None
+
+        if flow.epoch < self._cooldown_until.get(key, 0.0):
+            return None
+        self._cooldown_until[key] = flow.epoch + config.BEACON_COOLDOWN_SECONDS
+
+        # The more metronomic the timing, the more confident we are.
+        regularity = 1.0 - (coefficient_of_variation / config.BEACON_MAX_CV)
+        confidence = round(min(0.99, 0.70 + 0.29 * max(regularity, 0.0)), 2)
+
+        evidence = (
+            f"{flow.source_ip} contacted {flow.dest_ip} {len(window)} times at "
+            f"{mean_gap:.1f}s intervals, varying by only {std_dev:.2f}s. Timing "
+            f"this regular indicates an automated callback, not human activity"
+        )
+
+        return Alert(
+            timestamp=flow.timestamp,
+            threat_type=self.threat_type,
+            source_ip=flow.source_ip,
+            dest_ip=flow.dest_ip,
+            confidence=confidence,
+            evidence=evidence,
+            source=flow.source,
+        )
+
+
+# ---------------------------------------------------------------------------
+
+
 class DetectionEngine:
-    """Runs every flow record past all three rules, in order."""
+    """Runs every flow record past every rule, in order."""
 
     def __init__(self) -> None:
         self.detectors: list[BaseDetector] = [
             FloodDetector(),
             PortScanDetector(),
             ExfiltrationDetector(),
+            BeaconingDetector(),
         ]
 
     def reset(self) -> None:
@@ -246,10 +325,31 @@ class DetectionEngine:
             detector.reset()
 
     def analyze(self, flow: FlowRecord) -> list[Alert]:
-        """Read-only analysis of a single flow. Returns 0..3 alerts."""
+        """Read-only analysis of a single flow. Returns 0..4 alerts."""
         alerts: list[Alert] = []
         for detector in self.detectors:
             alert = detector.inspect(flow)
-            if alert is not None:
-                alerts.append(alert)
+            if alert is None:
+                continue
+            self._tag(alert, flow)
+            alerts.append(alert)
         return alerts
+
+    @staticmethod
+    def _tag(alert: Alert, flow: FlowRecord) -> None:
+        """
+        Attach triage metadata in one place.
+
+        Done centrally rather than inside each rule so severity and ATT&CK
+        mapping can never drift apart between detectors.
+        """
+        alert.severity = config.THREAT_SEVERITY.get(
+            alert.threat_type, config.SEVERITY_MEDIUM
+        )
+        mapping = config.MITRE_MAPPING.get(alert.threat_type)
+        if mapping:
+            alert.technique_id = mapping["technique_id"]
+            alert.technique = mapping["technique"]
+            alert.tactic = mapping["tactic"]
+        alert.process = flow.process
+        alert.hostname = flow.hostname

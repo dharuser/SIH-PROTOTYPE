@@ -11,18 +11,20 @@ TLS in front of it.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app import config
 from app.engine import SimulationService
-from app.models import Alert, FlowRecord, SimulationStats
+from app.models import Alert, FlowRecord, SimulationStats, utc_now_iso
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 logger = logging.getLogger("passive-threat-detector")
@@ -143,6 +145,60 @@ async def trigger_attack(threat_type: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Incident reporting
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/report", tags=["reporting"])
+async def report(limit: int = 500) -> dict:
+    """
+    Full incident report: aggregate counts plus the stored alert history.
+
+    Backed by SQLite, so it survives a restart of the analyser. This is the
+    artefact you would hand to someone reviewing the incident after the fact.
+    """
+    return {
+        "generated_at": utc_now_iso(),
+        "summary": simulation.store.summary(),
+        "live_session": simulation.stats().model_dump(),
+        "mitre_coverage": config.MITRE_MAPPING,
+        "alerts": simulation.store.query(limit=max(1, min(limit, 5000))),
+    }
+
+
+@app.get("/api/report.csv", tags=["reporting"])
+async def report_csv(limit: int = 1000) -> Response:
+    """The same alert history as a spreadsheet-friendly CSV download."""
+    rows = simulation.store.query(limit=max(1, min(limit, 5000)))
+
+    columns = [
+        "timestamp", "threat_type", "severity", "technique_id", "technique",
+        "tactic", "source_ip", "dest_ip", "confidence", "origin", "process",
+        "hostname", "evidence",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="threat-report.csv"'
+        },
+    )
+
+
+@app.delete("/api/report", tags=["reporting"])
+async def clear_report() -> dict:
+    """Erase the stored alert history. Live counters are untouched."""
+    simulation.store.clear()
+    return {"cleared": True}
+
+
+# ---------------------------------------------------------------------------
 # Live sensor ingest
 # ---------------------------------------------------------------------------
 
@@ -153,6 +209,10 @@ class SensorBatch(BaseModel):
     host: str | None = None
     interface: str | None = None
     flows: list[FlowRecord]
+    # Real interface-level counters. Kept separate from the flows because they
+    # cannot be attributed to individual connections; folding them into a flow's
+    # byte fields would be inventing data.
+    throughput: dict | None = None
 
 
 @app.post("/api/ingest", tags=["live sensor"])
@@ -171,7 +231,10 @@ async def ingest(batch: SensorBatch) -> dict:
         raise HTTPException(status_code=413, detail="Batch too large; send under 5000 flows.")
 
     return await simulation.ingest_flows(
-        batch.flows, host=batch.host, interface=batch.interface
+        batch.flows,
+        host=batch.host,
+        interface=batch.interface,
+        throughput=batch.throughput,
     )
 
 

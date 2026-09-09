@@ -795,3 +795,59 @@ body {
   font-weight: 800;
   letter-spacing: 0.05em;
 }
+
+/* --------------------------------------------- severity, MITRE, enrichment */
+
+.alert-row {
+  --severity-color: #64748b;
+  box-shadow: inset 3px 0 0 var(--severity-color);
+}
+
+.severity-pill {
+  --severity-color: #64748b;
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  white-space: nowrap;
+  color: var(--severity-color);
+  border: 1px solid var(--severity-color);
+  background: color-mix(in srgb, var(--severity-color) 16%, transparent);
+}
+
+.mitre-tag {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #9db0cf;
+  cursor: help;
+}
+
+.row-sub {
+  display: block;
+  margin-top: 3px;
+  font-size: 0.74rem;
+  color: #a6d8ff;
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.row-sub-dim {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ghost-button-sm {
+  padding: 5px 13px;
+  font-size: 0.8rem;
+}

@@ -25,3 +25,8 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# Generated at runtime by the alert store
+*.db
+*.db-journal
+*.pcap

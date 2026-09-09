@@ -1,0 +1,5 @@
+# Optional. The sensor runs on the standard library alone for packet capture
+# and .pcap replay. psutil adds two things:
+#   * connection mode  - real capture with no Administrator privileges
+#   * process names    - attributes a flow to the program that created it
+psutil==7.2.2

@@ -10,6 +10,7 @@ import ThreatChart from './components/ThreatChart'
 import { threatMeta } from './threats'
 import { useTelemetry } from './useTelemetry'
 import {
+  reportCsvUrl,
   resetSimulation,
   startSimulation,
   stopSimulation,
@@ -75,6 +76,12 @@ export default function App() {
     [showToast, sendCommand],
   )
 
+  const handleExport = useCallback(() => {
+    // Navigating to the URL lets the browser stream the download itself.
+    window.open(reportCsvUrl(), '_blank', 'noopener')
+    showToast('Incident report downloading as CSV')
+  }, [showToast])
+
   const handleSimAction = useCallback(
     async (action, label, wsAction) => {
       try {
@@ -132,7 +139,11 @@ export default function App() {
       />
 
       <div className="dashboard-grid">
-        <AlertTable alerts={alerts} />
+        <AlertTable
+          alerts={alerts}
+          canExport={stats.alerts_raised > 0}
+          onExport={handleExport}
+        />
         <div className="side-column">
           <SourcePanel stats={stats} />
           <ThreatChart countsByType={stats.alerts_by_type} />

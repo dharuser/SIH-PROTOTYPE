@@ -7,13 +7,29 @@ network. No database, no authentication, no machine learning.
 
 **What it detects**
 
-| Threat | Rule that fires it | Threshold |
-| --- | --- | --- |
-| Flood attack | Many different source IPs hitting one destination at once | 25+ unique sources to one dest within 5s |
-| Port scan | One source IP probing many ports on one destination | 12+ unique ports, same source→dest pair, within 5s |
-| Data exfiltration | A single flow sending out far more than it took in | `bytes_out > 20 × bytes_in` and `bytes_out > 250 KB` |
+| Threat | Rule that fires it | Threshold | Severity | ATT&CK |
+| --- | --- | --- | --- | --- |
+| Flood attack | Many different source IPs hitting one destination at once | 25+ unique sources to one dest within 5s | high | [T1498](https://attack.mitre.org/techniques/T1498/) |
+| Port scan | One source IP probing many ports on one destination | 12+ unique ports, same source→dest pair, within 5s | medium | [T1046](https://attack.mitre.org/techniques/T1046/) |
+| Data exfiltration | A single flow sending out far more than it took in | `bytes_out > 20 × bytes_in` and `bytes_out > 250 KB` | critical | [T1048](https://attack.mitre.org/techniques/T1048/) |
+| C2 beaconing | One host calling the same address on a metronome | 8+ check-ins whose gaps vary by under 8% | high | [T1071](https://attack.mitre.org/techniques/T1071/) |
 
-Every alert carries an `evidence` string in plain English explaining exactly why it fired.
+Every alert carries an `evidence` string in plain English explaining exactly why it
+fired, plus a severity and a MITRE ATT&CK technique so it can be tied to a known
+adversary playbook rather than read as an isolated curiosity.
+
+**Why beaconing is the interesting one.** The other three rules count things. This
+one measures *regularity*: malware sleeps a fixed number of seconds between
+check-ins, so the gaps between its connections are nearly identical, while human
+browsing is erratic. It is scored with the coefficient of variation — standard
+deviation of the gaps over their mean. Random traffic sits near 1.0; a scheduled
+beacon sits near 0.0.
+
+Tuning note worth knowing: at 6 check-ins and a 12% threshold this produced ~3
+false alarms per 36,000 benign flows, because a short run of random gaps
+occasionally looks regular by luck. Requiring 8 check-ins at 8% took that to zero
+across ~7 hours of simulated traffic. Heavily-jittered beacons (over ~20%
+variation) will evade it — that is the honest limit of the technique.
 
 ---
 
@@ -88,7 +104,14 @@ feed is running.
 | `POST` | `/api/simulation/reset` | Clear counters, history and detector windows |
 | `POST` | `/api/attack/{threat_type}` | Trigger `flood`, `port_scan` or `exfiltration` |
 | `POST` | `/api/ingest` | Receive real captured flows from the sensor |
+| `GET` | `/api/report` | Full incident report (JSON) from stored history |
+| `GET` | `/api/report.csv` | Same report as a CSV download |
+| `DELETE` | `/api/report` | Erase stored alert history |
 | `WS` | `/ws` | Live stream of flow records and alerts |
+
+Alerts are persisted to SQLite (`backend/alerts.db`, standard library, no server),
+so the report survives a restart. Resetting the live counters deliberately does
+*not* wipe stored history — the dashboard is for watching, the report is evidence.
 
 Trigger an attack without the UI:
 
@@ -189,9 +212,49 @@ detection on captured traffic proves the rules work on captured traffic.
 The sensor also mirrors the architecture being modelled — it reads packets and
 sends summaries in one direction, and the analyser has no channel back to it.
 
+### Three capture modes
+
+| Mode | Needs admin | Endpoints, ports, timing | Byte volumes | Process names |
+| --- | --- | --- | --- | --- |
+| `packet` | **yes** | ✓ | ✓ | ✓ |
+| `connection` | no | ✓ | ✗ | ✓ |
+| `pcap` replay | no | ✓ | ✓ | ✗ |
+
+`connection` mode reads the operating system's own connection table. It gives
+genuine endpoints, ports, protocol and the owning program with no privileges at
+all — but neither Windows nor Linux exposes per-connection byte counters to an
+unprivileged process. Those fields are reported as zero rather than estimated,
+which means the exfiltration rule stays silent in this mode instead of firing on
+numbers nobody measured. Flood, port scan and beaconing all work.
+
+Measured on a normal Windows laptop with no elevation: 82 real flows captured,
+process names on 44 of 50 (`brave.exe`, `node.exe`, `AvastSvc.exe`, `svchost.exe`),
+reverse DNS resolving to `ec2-*.compute-1.amazonaws.com`, interface throughput up
+to 356 KB/s — and zero false positives on genuine traffic.
+
+The sensor also reports real interface throughput separately from flow records,
+because those totals are true but cannot be attributed to individual connections.
+Folding them into a flow's byte fields would be inventing data.
+
 ### Run it
 
-Live capture is a privileged operation on every OS, so use an elevated shell.
+Optional but recommended, for process names and no-privilege mode:
+
+```powershell
+cd sensor
+pip install -r requirements.txt      # psutil
+```
+
+Then, with the analyser and dashboard already running:
+
+```powershell
+cd sensor
+py agent.py --list                   # shows which modes are available to you
+py agent.py                          # auto-selects the best available mode
+```
+
+Packet capture is a privileged operation on every OS, so use an elevated shell
+for full fidelity.
 
 ```powershell
 # Terminal 1 - analyser
@@ -214,8 +277,10 @@ Useful flags:
 
 | Flag | Purpose |
 | --- | --- |
-| `--list` | show local IPv4 addresses and whether you are elevated |
-| `--pcap FILE` | replay a real `.pcap` instead of capturing — **no privileges needed** |
+| `--list` | show capabilities and which mode would be auto-selected |
+| `--mode connection` | force no-privilege mode |
+| `--mode packet` | force raw packet capture (needs admin) |
+| `--pcap FILE` | replay a real `.pcap` — **no privileges needed** |
 | `--dry-run` | print flows without sending them |
 | `--interface IP` | Windows: which local IP to bind. Linux: interface name |
 | `--duration N` | stop after N seconds |

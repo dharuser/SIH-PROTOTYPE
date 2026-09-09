@@ -50,6 +50,14 @@ export const triggerAttack = (threatType) =>
 export const getStatus = () => request('/api/status')
 
 /**
+ * URL of the CSV incident report.
+ *
+ * Returned as a URL rather than fetched, so the browser handles it as a normal
+ * download instead of us buffering the whole file in memory just to re-save it.
+ */
+export const reportCsvUrl = () => `${API_BASE}/api/report.csv`
+
+/**
  * Resolves the WebSocket URL, preferring an explicit override, then the API
  * base, then the page origin.
  *

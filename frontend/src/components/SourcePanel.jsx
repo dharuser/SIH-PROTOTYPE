@@ -1,5 +1,12 @@
 const formatNumber = (value) => (value ?? 0).toLocaleString('en-US')
 
+function formatRate(bytesPerSecond) {
+  const value = bytesPerSecond ?? 0
+  if (value < 1024) return `${value} B/s`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(0)} KB/s`
+  return `${(value / (1024 * 1024)).toFixed(1)} MB/s`
+}
+
 /**
  * Shows where the analysed traffic is actually coming from.
  *
@@ -11,6 +18,7 @@ export default function SourcePanel({ stats }) {
   const live = stats.live_flows ?? 0
   const simulated = stats.simulated_flows ?? 0
   const connected = Boolean(stats.sensor_connected)
+  const throughput = stats.sensor_throughput
 
   return (
     <section className="panel source-panel" aria-labelledby="source-heading">
@@ -47,6 +55,15 @@ export default function SourcePanel({ stats }) {
             <dt>Capturing from</dt>
             <dd className="mono">{stats.sensor_interface || 'unknown'}</dd>
           </div>
+          {throughput && (
+            <div>
+              <dt>Interface throughput</dt>
+              <dd className="mono">
+                {formatRate(throughput.bytes_recv_per_sec)} in /{' '}
+                {formatRate(throughput.bytes_sent_per_sec)} out
+              </dd>
+            </div>
+          )}
         </dl>
       ) : (
         <p className="source-hint">

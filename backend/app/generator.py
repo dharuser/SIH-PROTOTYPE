@@ -191,11 +191,49 @@ def exfiltration_scenario() -> tuple[list[FlowRecord], float]:
     return records, 0.35
 
 
+def beaconing_scenario() -> tuple[list[FlowRecord], float]:
+    """
+    A compromised host checking in with a command-and-control server on a timer.
+
+    Real beacons usually sleep 30 seconds to several minutes. That is far too
+    slow to show a judge, so the interval here is compressed to under a second.
+    The rule is interval-agnostic: it measures how *regular* the gaps are, not
+    how long they are, so a compressed beacon is detected the same way a slow one
+    would be.
+
+    A small jitter is included because real malware jitters its sleep. It stays
+    well inside the regularity threshold, which is the point - jitter has to be
+    large enough to look human before it defeats this rule.
+    """
+    victim = random.choice(CLIENT_POOL)
+    c2_server = _random_external_ip()
+    port = random.choice([443, 8080, 53])
+
+    records = [
+        _make_flow(
+            source_ip=victim,
+            dest_ip=c2_server,
+            dest_port=port,
+            bytes_in=random.randint(200, 900),
+            bytes_out=random.randint(150, 700),
+            protocol="TCP",
+        )
+        for _ in range(10)
+    ]
+
+    return records, 0.6
+
+
 SCENARIO_BUILDERS = {
     config.THREAT_FLOOD: flood_scenario,
     config.THREAT_PORT_SCAN: port_scan_scenario,
     config.THREAT_EXFILTRATION: exfiltration_scenario,
+    config.THREAT_BEACONING: beaconing_scenario,
 }
+
+# Scenarios that must not monopolise the emit lock, because they deliberately
+# play out over several seconds and would otherwise freeze background traffic.
+SLOW_SCENARIOS = {config.THREAT_BEACONING}
 
 
 def build_scenario(name: str) -> tuple[list[FlowRecord], float]:

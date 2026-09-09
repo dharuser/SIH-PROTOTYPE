@@ -1,8 +1,8 @@
 """
 Passive Threat Detector - live capture sensor.
 
-Reads REAL packets off a network interface, summarises them into flow records,
-and ships them to the analyser over HTTP. Standard library only.
+Reads REAL network activity from this machine, summarises it into flow records,
+and ships them to the analyser over HTTP.
 
 Why this exists as a separate program
 -------------------------------------
@@ -11,24 +11,34 @@ mirrors the architecture it is modelling:
 
     [ monitored network ] --> sensor --> (one direction only) --> analyser
 
-The sensor reads packets and sends summaries out. It never injects, replies to,
+The sensor reads traffic and sends summaries out. It never injects, replies to,
 or modifies traffic, and the analyser has no channel back to it. That is exactly
 the constraint a hardware data diode imposes.
 
-Three capture modes
--------------------
-  live    real packets from a live interface        (needs Administrator/root)
-  pcap    real packets from a .pcap file           (no privileges needed)
-  --list  show interfaces and exit
+Capture modes
+-------------
+  packet      raw packet capture from a live interface   (needs Administrator/root)
+              full fidelity: endpoints, ports, timing AND byte volumes
+  connection  OS connection table polling                (NO privileges needed)
+              real endpoints, ports, timing and owning process, but no byte
+              volumes - the operating system does not expose per-connection
+              counters, so the exfiltration rule cannot run in this mode
+  pcap        replay a real .pcap file                   (NO privileges needed)
+              full fidelity, from traffic recorded earlier
+
+Being explicit about that limitation matters more than papering over it. The
+alternative would be inventing byte counts, which would make every exfiltration
+detection meaningless.
 
 Usage
 -----
-  python agent.py --backend http://127.0.0.1:8000
-  python agent.py --pcap capture.pcap --backend http://127.0.0.1:8000
+  python agent.py                        # auto-selects the best available mode
+  python agent.py --mode connection      # force no-privilege mode
+  python agent.py --pcap capture.pcap
   python agent.py --list
 
-Run the Windows shell as Administrator for live mode. Promiscuous capture is a
-privileged operation on every operating system.
+Optional dependency: psutil, for process attribution and connection mode.
+  pip install -r requirements.txt
 """
 
 from __future__ import annotations
@@ -37,6 +47,7 @@ import argparse
 import ctypes
 import json
 import os
+import queue
 import socket
 import struct
 import sys
@@ -46,6 +57,12 @@ import urllib.error
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
+
+try:
+    import psutil
+except ImportError:  # optional: only needed for connection mode / process names
+    psutil = None
+
 
 # ---------------------------------------------------------------------------
 # Packet parsing
@@ -61,8 +78,8 @@ PROTO_NAMES = {PROTO_TCP: "TCP", PROTO_UDP: "UDP"}
 # Ports that identify the server end of a conversation.
 WELL_KNOWN = {
     20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 110, 123, 143, 161, 389, 443, 445,
-    465, 587, 636, 993, 995, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 8080,
-    8443, 9200, 11211, 27017,
+    465, 587, 636, 993, 995, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 8000,
+    8080, 8443, 9200, 11211, 27017,
 }
 
 
@@ -129,8 +146,106 @@ def server_side(port_a: int, port_b: int) -> bool:
     return port_a <= port_b
 
 
+def iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds")
+
+
 # ---------------------------------------------------------------------------
-# Flow aggregation
+# Enrichment: which program owns a connection, and what is that IP called
+# ---------------------------------------------------------------------------
+
+
+class ProcessResolver:
+    """
+    Maps a local port to the program that owns it.
+
+    Turns "10.156.151.62 sent 40 MB out" into "msedge.exe sent 40 MB out", which
+    is the difference between an alert an analyst can act on and one they cannot.
+    Rebuilt on a short TTL because ports are reused constantly.
+    """
+
+    def __init__(self, ttl: float = 3.0) -> None:
+        self.ttl = ttl
+        self._by_port: dict[int, str] = {}
+        self._refreshed = 0.0
+        self.available = psutil is not None
+
+    def refresh(self, force: bool = False) -> None:
+        if not self.available:
+            return
+        if not force and (time.time() - self._refreshed) < self.ttl:
+            return
+        mapping: dict[int, str] = {}
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if not conn.laddr or not conn.pid:
+                    continue
+                try:
+                    mapping[conn.laddr.port] = psutil.Process(conn.pid).name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            return
+        self._by_port = mapping
+        self._refreshed = time.time()
+
+    def lookup(self, *ports: int) -> str | None:
+        for port in ports:
+            name = self._by_port.get(port)
+            if name:
+                return name
+        return None
+
+
+class DnsResolver:
+    """
+    Best-effort reverse DNS, resolved on a background thread.
+
+    Reverse lookups can block for seconds. Doing them inline would stall the
+    capture loop and lose packets, so addresses are queued and answered later;
+    flows are enriched only once a name is already cached. A hostname is a nice
+    detail, never worth dropping traffic for.
+    """
+
+    def __init__(self, max_entries: int = 4000) -> None:
+        self._cache: dict[str, str | None] = {}
+        self._queue: queue.Queue[str] = queue.Queue(maxsize=1000)
+        self._max = max_entries
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                ip = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._cache[ip] = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                self._cache[ip] = None
+
+    def lookup(self, ip: str) -> str | None:
+        if ip in self._cache:
+            return self._cache[ip]
+        if len(self._cache) < self._max:
+            try:
+                self._queue.put_nowait(ip)
+            except queue.Full:
+                pass
+        return None
+
+    @property
+    def resolved(self) -> int:
+        return sum(1 for v in self._cache.values() if v)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
+# Flow aggregation (packet and pcap modes)
 # ---------------------------------------------------------------------------
 
 
@@ -145,7 +260,6 @@ class FlowAggregator:
 
     def __init__(self, exclude_ips: set[str] | None = None) -> None:
         self._bytes: dict[tuple, int] = defaultdict(int)
-        self._packets: dict[tuple, int] = defaultdict(int)
         self._first_seen: dict[tuple, float] = {}
         self._lock = threading.Lock()
         self._exclude = exclude_ips or set()
@@ -171,7 +285,6 @@ class FlowAggregator:
         key = (src_ip, src_port, dst_ip, dst_port, proto)
         with self._lock:
             self._bytes[key] += size
-            self._packets[key] += 1
             existing = self._first_seen.get(key)
             if existing is None or observed_at < existing:
                 self._first_seen[key] = observed_at
@@ -182,7 +295,6 @@ class FlowAggregator:
             byte_counts = dict(self._bytes)
             first_seen = dict(self._first_seen)
             self._bytes.clear()
-            self._packets.clear()
             self._first_seen.clear()
 
         records: list[dict] = []
@@ -198,29 +310,30 @@ class FlowAggregator:
             handled.add(reverse)
 
             if server_side(dst_port, src_port):
-                client_ip, server_ip, server_port = src_ip, dst_ip, dst_port
+                client_ip, client_port = src_ip, src_port
+                server_ip, server_port = dst_ip, dst_port
                 bytes_out, bytes_in = forward_bytes, reverse_bytes
             else:
-                client_ip, server_ip, server_port = dst_ip, src_ip, src_port
+                client_ip, client_port = dst_ip, dst_port
+                server_ip, server_port = src_ip, src_port
                 bytes_out, bytes_in = reverse_bytes, forward_bytes
 
             own = first_seen.get(key)
             other = first_seen.get(reverse)
             candidates = [v for v in (own, other) if v is not None]
             started = min(candidates) if candidates else time.time()
-            records.append(
-                {
-                    "timestamp": datetime.fromtimestamp(started, timezone.utc)
-                    .isoformat(timespec="milliseconds"),
-                    "source_ip": client_ip,
-                    "dest_ip": server_ip,
-                    "dest_port": server_port,
-                    "bytes_in": bytes_in,
-                    "bytes_out": bytes_out,
-                    "protocol": proto,
-                    "source": "live",
-                }
-            )
+
+            records.append({
+                "timestamp": iso(started),
+                "source_ip": client_ip,
+                "dest_ip": server_ip,
+                "dest_port": server_port,
+                "bytes_in": bytes_in,
+                "bytes_out": bytes_out,
+                "protocol": proto,
+                "source": "live",
+                "_local_ports": (client_port, server_port),
+            })
 
         return records
 
@@ -243,10 +356,10 @@ def local_ipv4_addresses() -> list[str]:
     """Every IPv4 address this host owns, best guess first."""
     found: list[str] = []
     try:
-        primary = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        primary.connect(("8.8.8.8", 80))  # no packets sent; just picks a route
-        found.append(primary.getsockname()[0])
-        primary.close()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))  # no packets sent; just picks a route
+        found.append(probe.getsockname()[0])
+        probe.close()
     except Exception:
         pass
     try:
@@ -263,6 +376,7 @@ class WindowsCapture:
     """Promiscuous capture via raw socket + SIO_RCVALL. Needs Administrator."""
 
     strips_ethernet = False
+    measures_bytes = True
 
     def __init__(self, bind_ip: str) -> None:
         self.bind_ip = bind_ip
@@ -290,6 +404,7 @@ class LinuxCapture:
     """Promiscuous capture via AF_PACKET. Needs root or CAP_NET_RAW."""
 
     strips_ethernet = True
+    measures_bytes = True
 
     def __init__(self, interface: str | None = None) -> None:
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
@@ -309,16 +424,12 @@ class LinuxCapture:
 
 
 class PcapFileCapture:
-    """
-    Replays a real .pcap file. No privileges required.
+    """Replays a real .pcap file. No privileges required."""
 
-    Useful when live capture is not permitted: the packets are still genuine
-    captured traffic, just recorded earlier.
-    """
+    measures_bytes = True
 
-    def __init__(self, path: str, speed: float = 1.0) -> None:
+    def __init__(self, path: str) -> None:
         self.path = path
-        self.speed = speed
         self.handle = open(path, "rb")
 
         header = self.handle.read(24)
@@ -337,7 +448,6 @@ class PcapFileCapture:
 
         self.nanosecond = magic in (b"\xa1\xb2\x3c\x4d", b"\x4d\x3c\xb2\xa1")
         self.linktype = struct.unpack(self.endian + "I", header[20:24])[0]
-        # 1 = Ethernet, 101/12/14 = raw IP
         self.strips_ethernet = self.linktype == 1
         if self.linktype not in (1, 12, 14, 101, 228):
             raise ValueError(f"unsupported pcap link type {self.linktype}")
@@ -351,12 +461,150 @@ class PcapFileCapture:
         payload = self.handle.read(incl_len)
         if not payload:
             return None
-        # The capture's own recorded time, so replay preserves real spacing.
         divisor = 1_000_000_000 if self.nanosecond else 1_000_000
         return sec + frac / divisor, payload
 
     def close(self) -> None:
         self.handle.close()
+
+
+class ConnectionPoller:
+    """
+    Reads the operating system's own connection table. No privileges required.
+
+    Every newly-observed connection becomes one flow record with genuine
+    endpoints, ports, protocol and owning process. What it CANNOT provide is byte
+    volume: neither Windows nor Linux exposes per-connection counters to an
+    unprivileged process. Those fields are therefore reported as zero rather than
+    estimated, which means the exfiltration rule stays silent in this mode
+    instead of firing on numbers nobody measured.
+    """
+
+    measures_bytes = False
+
+    def __init__(self, exclude_ips: set[str], resolver: ProcessResolver) -> None:
+        if psutil is None:
+            raise RuntimeError("connection mode requires psutil (pip install psutil)")
+        self._seen: dict[tuple, float] = {}
+        self._exclude = exclude_ips
+        self._resolver = resolver
+        self._locals = set(local_ipv4_addresses())
+        self.bind_ip = "OS connection table"
+        self.connections_seen = 0
+
+    def poll(self) -> list[dict]:
+        now = time.time()
+        records: list[dict] = []
+
+        try:
+            connections = psutil.net_connections(kind="inet")
+        except Exception:
+            return records
+
+        self._resolver.refresh()
+
+        for conn in connections:
+            if not conn.raddr or not conn.laddr:
+                continue
+            local_ip, local_port = conn.laddr.ip, conn.laddr.port
+            remote_ip, remote_port = conn.raddr.ip, conn.raddr.port
+
+            if remote_ip in self._exclude or local_ip in self._exclude:
+                continue
+            if remote_ip.startswith("127.") or remote_ip == "::1":
+                continue
+
+            proto = "TCP" if conn.type == socket.SOCK_STREAM else "UDP"
+            key = (local_ip, local_port, remote_ip, remote_port, proto)
+
+            # Only report a connection once, when first observed. Repeat
+            # check-ins to the same host open new connections, which is exactly
+            # the signal the beaconing rule needs.
+            if key in self._seen:
+                continue
+            self._seen[key] = now
+            self.connections_seen += 1
+
+            process = None
+            if conn.pid:
+                try:
+                    process = psutil.Process(conn.pid).name()
+                except Exception:
+                    process = None
+
+            if server_side(remote_port, local_port):
+                client_ip, server_ip, server_port = local_ip, remote_ip, remote_port
+            else:
+                client_ip, server_ip, server_port = remote_ip, local_ip, local_port
+
+            records.append({
+                "timestamp": iso(now),
+                "source_ip": client_ip,
+                "dest_ip": server_ip,
+                "dest_port": server_port,
+                "bytes_in": 0,
+                "bytes_out": 0,
+                "protocol": proto,
+                "source": "live",
+                "process": process,
+                "_local_ports": (local_port,),
+            })
+
+        # Forget connections that have closed, so a later reconnection to the
+        # same host counts as a fresh check-in.
+        live_keys = set()
+        for conn in connections:
+            if conn.raddr and conn.laddr:
+                proto = "TCP" if conn.type == socket.SOCK_STREAM else "UDP"
+                live_keys.add(
+                    (conn.laddr.ip, conn.laddr.port, conn.raddr.ip, conn.raddr.port, proto)
+                )
+        for key in list(self._seen):
+            if key not in live_keys:
+                del self._seen[key]
+
+        return records
+
+    def close(self) -> None:
+        pass
+
+
+class ThroughputMeter:
+    """
+    Real interface-level byte counters.
+
+    Deliberately kept separate from flow records. These totals are genuine but
+    cannot be attributed to individual connections, so they are reported as
+    overall throughput rather than folded into any flow's byte fields.
+    """
+
+    def __init__(self) -> None:
+        self.available = psutil is not None
+        self._last: tuple[float, int, int] | None = None
+
+    def sample(self) -> dict | None:
+        if not self.available:
+            return None
+        try:
+            counters = psutil.net_io_counters()
+        except Exception:
+            return None
+        now = time.time()
+        current = (now, counters.bytes_sent, counters.bytes_recv)
+        if self._last is None:
+            self._last = current
+            return None
+        elapsed = now - self._last[0]
+        if elapsed <= 0:
+            return None
+        result = {
+            "bytes_sent_per_sec": int((current[1] - self._last[1]) / elapsed),
+            "bytes_recv_per_sec": int((current[2] - self._last[2]) / elapsed),
+            "total_sent": current[1],
+            "total_recv": current[2],
+        }
+        self._last = current
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -365,21 +613,27 @@ class PcapFileCapture:
 
 
 class Shipper:
-    def __init__(self, backend: str, host_label: str, interface: str) -> None:
+    def __init__(self, backend: str, host_label: str, interface: str, mode: str) -> None:
         self.url = backend.rstrip("/") + "/api/ingest"
         self.host_label = host_label
         self.interface = interface
+        self.mode = mode
         self.sent = 0
         self.alerts = 0
         self.failures = 0
 
-    def send(self, flows: list[dict]) -> dict | None:
-        body = json.dumps(
-            {"host": self.host_label, "interface": self.interface, "flows": flows}
-        ).encode()
+    def send(self, flows: list[dict], throughput: dict | None = None) -> dict | None:
+        payload = {
+            "host": self.host_label,
+            "interface": f"{self.interface} [{self.mode}]",
+            "flows": flows,
+        }
+        if throughput:
+            payload["throughput"] = throughput
+
         request = urllib.request.Request(
             self.url,
-            data=body,
+            data=json.dumps(payload).encode(),
             method="POST",
             headers={"Content-Type": "application/json"},
         )
@@ -391,7 +645,7 @@ class Shipper:
             return result
         except urllib.error.HTTPError as e:
             self.failures += 1
-            print(f"  ! analyser rejected batch: HTTP {e.code} {e.read()[:120]!r}")
+            print(f"  ! analyser rejected batch: HTTP {e.code} {e.read()[:150]!r}")
         except Exception as e:
             self.failures += 1
             print(f"  ! could not reach analyser: {type(e).__name__}: {str(e)[:100]}")
@@ -403,17 +657,34 @@ class Shipper:
 # ---------------------------------------------------------------------------
 
 
-def build_capture(args) -> object:
+def choose_mode(args) -> str:
     if args.pcap:
+        return "pcap"
+    if args.mode != "auto":
+        return args.mode
+    if is_elevated():
+        return "packet"
+    if psutil is not None:
+        return "connection"
+    return "packet"  # will fail with a clear privilege message
+
+
+def build_capture(mode: str, args, exclude: set[str], resolver: ProcessResolver):
+    if mode == "pcap":
         return PcapFileCapture(args.pcap)
 
+    if mode == "connection":
+        return ConnectionPoller(exclude, resolver)
+
     if not is_elevated():
-        print("ERROR: live capture needs elevated privileges.")
+        print("ERROR: packet capture needs elevated privileges.")
         if os.name == "nt":
-            print("  Right-click Windows PowerShell -> 'Run as Administrator', then retry.")
-            print("  Or capture to a file in Wireshark and replay it with --pcap file.pcap")
+            print("  Right-click PowerShell -> 'Run as Administrator', then retry.")
         else:
-            print("  Re-run with sudo, or replay a capture with --pcap file.pcap")
+            print("  Re-run with sudo.")
+        print("  No admin? Two options that need no privileges at all:")
+        print("    python agent.py --mode connection      (real connections + process names)")
+        print("    python agent.py --pcap capture.pcap    (replay a Wireshark capture)")
         sys.exit(2)
 
     if os.name == "nt":
@@ -424,12 +695,25 @@ def build_capture(args) -> object:
     return LinuxCapture(args.interface)
 
 
+def enrich(records: list[dict], resolver: ProcessResolver, dns: DnsResolver) -> None:
+    """Attach the owning program and a hostname where we can, in place."""
+    resolver.refresh()
+    for record in records:
+        ports = record.pop("_local_ports", ())
+        if not record.get("process"):
+            record["process"] = resolver.lookup(*ports)
+        record["hostname"] = dns.lookup(record["dest_ip"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Capture real network flows and feed them to the Passive Threat Detector."
+        description="Capture real network activity and feed it to the Passive Threat Detector."
     )
     parser.add_argument("--backend", default="http://127.0.0.1:8000",
                         help="analyser base URL (default: http://127.0.0.1:8000)")
+    parser.add_argument("--mode", default="auto",
+                        choices=["auto", "packet", "connection"],
+                        help="capture mode (default: auto)")
     parser.add_argument("--interface", default=None,
                         help="Windows: local IP to bind. Linux: interface name.")
     parser.add_argument("--pcap", default=None,
@@ -439,7 +723,7 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=0,
                         help="stop after N seconds (0 = run until Ctrl+C)")
     parser.add_argument("--list", action="store_true",
-                        help="list local IPv4 addresses and exit")
+                        help="show capabilities and exit")
     parser.add_argument("--dry-run", action="store_true",
                         help="capture and print flows without sending them")
     args = parser.parse_args()
@@ -448,7 +732,9 @@ def main() -> None:
         print("Local IPv4 addresses (use one with --interface):")
         for addr in local_ipv4_addresses():
             print(f"  {addr}")
-        print(f"\nElevated: {is_elevated()}")
+        print(f"\nElevated (packet capture available) : {is_elevated()}")
+        print(f"psutil present (connection mode)    : {psutil is not None}")
+        print(f"Mode that would be auto-selected    : {choose_mode(args)}")
         return
 
     # Resolve the analyser's own address so we can exclude our own reporting
@@ -461,71 +747,101 @@ def main() -> None:
     except Exception:
         pass
 
-    print("=" * 66)
+    mode = choose_mode(args)
+    resolver = ProcessResolver()
+    dns = DnsResolver()
+    throughput = ThroughputMeter()
+
+    print("=" * 70)
     print(" Passive Threat Detector - live capture sensor")
-    print("=" * 66)
-    print(f"  mode     : {'pcap replay' if args.pcap else 'live interface capture'}")
-    print(f"  analyser : {args.backend}")
-    print(f"  excluded : {', '.join(sorted(exclude))}  (own reporting traffic)")
+    print("=" * 70)
+    print(f"  mode      : {mode}")
+    print(f"  analyser  : {args.backend}")
+    print(f"  excluded  : {', '.join(sorted(exclude))}  (own reporting traffic)")
 
-    capture = build_capture(args)
-    strips_ethernet = getattr(capture, "strips_ethernet", False)
-    aggregator = FlowAggregator(exclude_ips=exclude)
-    shipper = Shipper(args.backend, socket.gethostname(), str(getattr(capture, "bind_ip", "?")))
+    capture = build_capture(mode, args, exclude, resolver)
+    measures_bytes = getattr(capture, "measures_bytes", True)
 
-    print(f"  source   : {shipper.interface}")
-    print("-" * 66)
-    print("  Capturing. Generate traffic to see flows appear. Ctrl+C to stop.")
-    print("  Tip: uploading a large file should trip the exfiltration rule.")
-    print("-" * 66)
+    print(f"  source    : {getattr(capture, 'bind_ip', '?')}")
+    print(f"  byte volumes measurable : {measures_bytes}")
+    if not measures_bytes:
+        print("    -> flood, port scan and beaconing rules active")
+        print("    -> exfiltration rule inactive (needs per-connection volumes,")
+        print("       which the OS will not give an unprivileged process)")
+    print("-" * 70)
+    print("  Ctrl+C to stop.")
+    if measures_bytes and mode != "pcap":
+        print("  Tip: upload a large file to trip the exfiltration rule.")
+    print("-" * 70)
 
+    shipper = Shipper(
+        args.backend, socket.gethostname(), str(getattr(capture, "bind_ip", "?")), mode
+    )
     stop = threading.Event()
+    aggregator: FlowAggregator | None = None
+    thread: threading.Thread | None = None
 
-    def reader() -> None:
-        while not stop.is_set():
-            try:
-                item = capture.read()
-            except Exception as e:
-                print(f"  ! capture error: {type(e).__name__}: {e}")
-                break
-            if item is None:
-                if args.pcap:
-                    stop.set()
+    if mode in ("packet", "pcap"):
+        aggregator = FlowAggregator(exclude_ips=exclude)
+        strips_ethernet = getattr(capture, "strips_ethernet", False)
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    item = capture.read()
+                except Exception as e:
+                    print(f"  ! capture error: {type(e).__name__}: {e}")
                     break
-                continue
-            observed_at, raw = item
-            payload = parse_ethernet(raw) if strips_ethernet else raw
-            if payload is None:
-                continue
-            parsed = parse_ipv4(payload)
-            if parsed:
-                aggregator.add_packet(parsed, observed_at)
+                if item is None:
+                    if mode == "pcap":
+                        stop.set()
+                        break
+                    continue
+                observed_at, raw = item
+                payload = parse_ethernet(raw) if strips_ethernet else raw
+                if payload is None:
+                    continue
+                parsed = parse_ipv4(payload)
+                if parsed:
+                    aggregator.add_packet(parsed, observed_at)
 
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
 
     started = time.time()
     try:
         while not stop.is_set():
             time.sleep(args.interval)
-            flows = aggregator.drain()
             elapsed = time.time() - started
+
+            flows = aggregator.drain() if aggregator else capture.poll()
+            enrich(flows, resolver, dns)
+            tp = throughput.sample()
 
             if flows:
                 if args.dry_run:
                     for f in flows[:8]:
-                        print(f"    {f['source_ip']}:{'':<1} -> {f['dest_ip']}:{f['dest_port']}"
-                              f" {f['protocol']}  out={f['bytes_out']} in={f['bytes_in']}")
+                        proc = f.get("process") or "?"
+                        host = f.get("hostname") or ""
+                        print(f"    {f['source_ip']} -> {f['dest_ip']}:{f['dest_port']} "
+                              f"{f['protocol']} out={f['bytes_out']} in={f['bytes_in']} "
+                              f"[{proc}] {host}")
                     result = None
                 else:
-                    result = shipper.send(flows)
+                    result = shipper.send(flows, tp)
                 raised = result.get("alerts_raised", 0) if result else 0
                 flag = f"  <-- {raised} ALERT(S)" if raised else ""
-                print(f"  [{elapsed:6.1f}s] packets={aggregator.packets_seen:6d}"
-                      f"  flows sent={len(flows):3d}  total={shipper.sent:5d}{flag}")
+                seen = (aggregator.packets_seen if aggregator
+                        else capture.connections_seen)
+                unit = "packets" if aggregator else "conns"
+                rate = ""
+                if tp:
+                    rate = (f"  net {tp['bytes_recv_per_sec']//1024:>5d}KB/s in"
+                            f" {tp['bytes_sent_per_sec']//1024:>5d}KB/s out")
+                print(f"  [{elapsed:6.1f}s] {unit}={seen:6d}  flows={len(flows):3d}"
+                      f"  total={shipper.sent:5d}{rate}{flag}")
             else:
-                print(f"  [{elapsed:6.1f}s] packets={aggregator.packets_seen:6d}"
-                      f"  no new flows")
+                print(f"  [{elapsed:6.1f}s] no new flows")
 
             if args.duration and elapsed >= args.duration:
                 break
@@ -533,18 +849,25 @@ def main() -> None:
         print("\n  stopping...")
     finally:
         stop.set()
-        remaining = aggregator.drain()
-        if remaining and not args.dry_run:
-            shipper.send(remaining)
+        if aggregator:
+            remaining = aggregator.drain()
+            enrich(remaining, resolver, dns)
+            if remaining and not args.dry_run:
+                shipper.send(remaining)
         capture.close()
+        dns.stop()
 
-    print("-" * 66)
-    print(f"  packets examined : {aggregator.packets_seen}")
-    print(f"  packets excluded : {aggregator.packets_ignored} (traffic to the analyser)")
-    print(f"  flows shipped    : {shipper.sent}")
-    print(f"  alerts raised    : {shipper.alerts}")
-    print(f"  failed batches   : {shipper.failures}")
-    print("=" * 66)
+    print("-" * 70)
+    if aggregator:
+        print(f"  packets examined  : {aggregator.packets_seen}")
+        print(f"  packets excluded  : {aggregator.packets_ignored} (analyser traffic)")
+    else:
+        print(f"  connections seen  : {capture.connections_seen}")
+    print(f"  flows shipped     : {shipper.sent}")
+    print(f"  alerts raised     : {shipper.alerts}")
+    print(f"  hostnames resolved: {dns.resolved}")
+    print(f"  failed batches    : {shipper.failures}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
