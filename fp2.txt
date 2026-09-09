@@ -1,5 +1,0 @@
-REAL network monitoring result
-  live flows captured : 96
-  simulated flows     : 0
-  alerts by type      : {'flood': 0, 'port_scan': 0, 'exfiltration': 0, 'beaconing': 0}
-  FALSE POSITIVES     : 0

@@ -1,9 +1,0 @@
-REAL network monitoring, simulator OFF
-  live flows captured : 40
-  simulated flows     : 0
-  sensor host         : DHTORQUE
-  sensor mode         : OS connection table [connection]
-  alerts by type      : {'flood': 0, 'port_scan': 0, 'exfiltration': 0, 'beaconing': 0}
-  FALSE POSITIVES     : 0
-
-  programs seen on the wire: {'Kiro.exe': 31, 'pwsh.exe': 5, 'svchost.exe': 2, 'CoreSync.exe': 1}
